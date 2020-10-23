@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
 #
 import uuid
-import re
 
 from django.db import models, transaction
-from django.db.models import Q
-from django.db.utils import IntegrityError
+from django.db.models import Q, F, Case, When
 from django.utils.translation import ugettext_lazy as _
 from django.utils.translation import ugettext
 from django.db.transaction import atomic
 
+from common.struct import Stack
 from common.utils import get_logger
 from common.utils.common import lazyproperty
 from orgs.mixins.models import OrgModelMixin, OrgManager
@@ -17,15 +16,11 @@ from orgs.utils import get_current_org, tmp_to_org
 from orgs.models import Organization
 
 
-__all__ = ['Node', 'FamilyMixin', 'compute_parent_key']
+__all__ = ['Node']
 logger = get_logger(__name__)
 
 
-def compute_parent_key(key):
-    try:
-        return key[:key.rindex(':')]
-    except ValueError:
-        return ''
+MPTT_BEGIN_SERIAL = 1
 
 
 class NodeQuerySet(models.QuerySet):
@@ -33,328 +28,43 @@ class NodeQuerySet(models.QuerySet):
         raise NotImplementedError
 
 
-class FamilyMixin:
-    __parents = None
-    __children = None
-    __all_children = None
-    is_node = True
-
-    @staticmethod
-    def clean_children_keys(nodes_keys):
-        sort_key = lambda k: [int(i) for i in k.split(':')]
-        nodes_keys = sorted(list(nodes_keys), key=sort_key)
-
-        nodes_keys_clean = []
-        base_key = ''
-        for key in nodes_keys:
-            if key.startswith(base_key + ':'):
-                continue
-            nodes_keys_clean.append(key)
-            base_key = key
-        return nodes_keys_clean
-
-    @classmethod
-    def get_node_all_children_key_pattern(cls, key, with_self=True):
-        pattern = r'^{0}:'.format(key)
-        if with_self:
-            pattern += r'|^{0}$'.format(key)
-        return pattern
-
-    @classmethod
-    def get_node_children_key_pattern(cls, key, with_self=True):
-        pattern = r'^{0}:[0-9]+$'.format(key)
-        if with_self:
-            pattern += r'|^{0}$'.format(key)
-        return pattern
-
-    def get_children_key_pattern(self, with_self=False):
-        return self.get_node_children_key_pattern(self.key, with_self=with_self)
-
-    def get_all_children_pattern(self, with_self=False):
-        return self.get_node_all_children_key_pattern(self.key, with_self=with_self)
-
-    def is_children(self, other):
-        children_pattern = other.get_children_key_pattern(with_self=False)
-        return re.match(children_pattern, self.key)
-
-    def get_children(self, with_self=False):
-        q = Q(parent_key=self.key)
-        if with_self:
-            q |= Q(key=self.key)
-        return Node.objects.filter(q)
-
-    def get_all_children(self, with_self=False):
-        q = Q(key__istartswith=f'{self.key}:')
-        if with_self:
-            q |= Q(key=self.key)
-        return Node.objects.filter(q)
-
-    @property
-    def children(self):
-        return self.get_children(with_self=False)
-
-    @property
-    def all_children(self):
-        return self.get_all_children(with_self=False)
-
-    def create_child(self, value=None, _id=None):
-        with atomic(savepoint=False):
-            child_key = self.get_next_child_key()
-            if value is None:
-                value = child_key
-            child = self.__class__.objects.create(
-                id=_id, key=child_key, value=value, parent_key=self.key,
-            )
-            return child
-
-    def get_or_create_child(self, value, _id=None):
-        """
-        :return: Node, bool (created)
-        """
-        children = self.get_children()
-        exist = children.filter(value=value).exists()
-        if exist:
-            child = children.filter(value=value).first()
-            created = False
-        else:
-            child = self.create_child(value, _id)
-            created = True
-        return child, created
-
-    def get_next_child_key(self):
-        mark = self.child_mark
-        self.child_mark += 1
-        self.save()
-        return "{}:{}".format(self.key, mark)
-
-    def get_next_child_preset_name(self):
-        name = ugettext("New node")
-        values = [
-            child.value[child.value.rfind(' '):]
-            for child in self.get_children()
-            if child.value.startswith(name)
-        ]
-        values = [int(value) for value in values if value.strip().isdigit()]
-        count = max(values) + 1 if values else 1
-        return '{} {}'.format(name, count)
-
-    # Parents
-    @classmethod
-    def get_node_ancestor_keys(cls, key, with_self=False):
-        parent_keys = []
-        key_list = key.split(":")
-        if not with_self:
-            key_list.pop()
-        for i in range(len(key_list)):
-            parent_keys.append(":".join(key_list))
-            key_list.pop()
-        return parent_keys
-
-    def get_ancestor_keys(self, with_self=False):
-        return self.get_node_ancestor_keys(
-            self.key, with_self=with_self
-        )
-
-    @property
-    def ancestors(self):
-        return self.get_ancestors(with_self=False)
-
-    def get_ancestors(self, with_self=False):
-        ancestor_keys = self.get_ancestor_keys(with_self=with_self)
-        return self.__class__.objects.filter(key__in=ancestor_keys)
-
-    # @property
-    # def parent_key(self):
-    #     parent_key = ":".join(self.key.split(":")[:-1])
-    #     return parent_key
-
-    def compute_parent_key(self):
-        return compute_parent_key(self.key)
-
-    def is_parent(self, other):
-        return other.is_children(self)
-
-    @property
-    def parent(self):
-        if self.is_org_root():
-            return self
-        parent_key = self.parent_key
-        return Node.objects.get(key=parent_key)
-
-    @parent.setter
-    def parent(self, parent):
-        if not self.is_node:
-            self.key = parent.key + ':fake'
-            return
-        children = self.get_all_children()
-        old_key = self.key
-        with transaction.atomic():
-            self.key = parent.get_next_child_key()
-            self.save()
-            for child in children:
-                child.key = child.key.replace(old_key, self.key, 1)
-                child.save()
-
-    def get_siblings(self, with_self=False):
-        key = ':'.join(self.key.split(':')[:-1])
-        pattern = r'^{}:[0-9]+$'.format(key)
-        sibling = Node.objects.filter(
-            key__regex=pattern.format(self.key)
-        )
-        if not with_self:
-            sibling = sibling.exclude(key=self.key)
-        return sibling
-
-    @classmethod
-    def create_node_by_full_value(cls, full_value):
-        if not full_value:
-            return []
-        nodes_family = full_value.split('/')
-        nodes_family = [v for v in nodes_family if v]
-        org_root = cls.org_root()
-        if nodes_family[0] == org_root.value:
-            nodes_family = nodes_family[1:]
-        return cls.create_nodes_recurse(nodes_family, org_root)
-
-    @classmethod
-    def create_nodes_recurse(cls, values, parent=None):
-        values = [v for v in values if v]
-        if not values:
-            return None
-        if parent is None:
-            parent = cls.org_root()
-        value = values[0]
-        child, created = parent.get_or_create_child(value=value)
-        if len(values) == 1:
-            return child
-        return cls.create_nodes_recurse(values[1:], child)
-
-    def get_family(self):
-        ancestors = self.get_ancestors()
-        children = self.get_all_children()
-        return [*tuple(ancestors), self, *tuple(children)]
-
-
 class NodeAssetsMixin:
     key = ''
     id = None
 
-    def get_all_assets(self):
-        from .asset import Asset
-        q = Q(nodes__key__startswith=f'{self.key}:') | Q(nodes__key=self.key)
-        return Asset.objects.filter(q).distinct()
-
-    @classmethod
-    def get_node_all_assets_by_key_v2(cls, key):
-        # 最初的写法是：
-        #   Asset.objects.filter(Q(nodes__key__startswith=f'{node.key}:') | Q(nodes__id=node.id))
-        #   可是 startswith 会导致表关联时 Asset 索引失效
-        from .asset import Asset
-        node_ids = cls.objects.filter(
-            Q(key__startswith=f'{key}:') |
-            Q(key=key)
-        ).values_list('id', flat=True).distinct()
-        assets = Asset.objects.filter(
-            nodes__id__in=list(node_ids)
-        ).distinct()
-        return assets
-
-    def get_assets(self):
-        from .asset import Asset
-        assets = Asset.objects.filter(nodes=self)
-        return assets.distinct()
-
-    def get_valid_assets(self):
-        return self.get_assets().valid()
-
-    def get_all_valid_assets(self):
-        return self.get_all_assets().valid()
-
-    @classmethod
-    def get_nodes_all_assets_ids(cls, nodes_keys):
-        assets_ids = cls.get_nodes_all_assets(nodes_keys).values_list('id', flat=True)
-        return assets_ids
-
-    @classmethod
-    def get_nodes_all_assets(cls, nodes_keys, extra_assets_ids=None):
-        from .asset import Asset
-        nodes_keys = cls.clean_children_keys(nodes_keys)
-        q = Q()
-        node_ids = ()
-        for key in nodes_keys:
-            q |= Q(key__startswith=f'{key}:')
-            q |= Q(key=key)
-        if q:
-            node_ids = Node.objects.filter(q).distinct().values_list('id', flat=True)
-
-        q = Q(nodes__id__in=list(node_ids))
-        if extra_assets_ids:
-            q |= Q(id__in=extra_assets_ids)
-        if q:
-            return Asset.org_objects.filter(q).distinct()
-        else:
-            return Asset.objects.none()
-
 
 class SomeNodesMixin:
-    key = ''
-    default_key = '1'
     default_value = 'Default'
-    empty_key = '-11'
     empty_value = _("empty")
 
     @classmethod
     def default_node(cls):
         with tmp_to_org(Organization.default()):
-            defaults = {'value': cls.default_value}
-            try:
-                obj, created = cls.objects.get_or_create(
-                    defaults=defaults, key=cls.default_key,
-                )
-            except IntegrityError as e:
-                logger.error("Create default node failed: {}".format(e))
-                cls.modify_other_org_root_node_key()
-                obj, created = cls.objects.get_or_create(
-                    defaults=defaults, key=cls.default_key,
-                )
+            defaults = {'value': cls.default_value, 'left': 1, 'right': 2}
+            obj, created = cls.objects.get_or_create(
+                defaults=defaults, left=1, org_id=Organization.DEFAULT_ID
+            )
             return obj
 
-    def is_default_node(self):
-        return self.key == self.default_key
-
     def is_org_root(self):
-        if self.key.isdigit():
+        if self.left == 1:
             return True
         else:
             return False
 
     @classmethod
-    def get_next_org_root_node_key(cls):
-        with tmp_to_org(Organization.root()):
-            org_nodes_roots = cls.objects.filter(key__regex=r'^[0-9]+$')
-            org_nodes_roots_keys = org_nodes_roots.values_list('key', flat=True)
-            if not org_nodes_roots_keys:
-                org_nodes_roots_keys = ['1']
-            max_key = max([int(k) for k in org_nodes_roots_keys])
-            key = str(max_key + 1) if max_key != 0 else '2'
-            return key
-
-    @classmethod
     def create_org_root_node(cls):
         # 如果使用current_org 在set_current_org时会死循环
         ori_org = get_current_org()
-        with transaction.atomic():
+        with transaction.atomic(savepoint=False):
             if not ori_org.is_real():
                 return cls.default_node()
-            key = cls.get_next_org_root_node_key()
-            root = cls.objects.create(key=key, value=ori_org.name)
+            root = cls.objects.create(value=ori_org.name)
             return root
 
     @classmethod
     def org_root(cls):
-        root = cls.objects.filter(parent_key='')\
-            .filter(key__regex=r'^[0-9]+$')\
-            .exclude(key__startswith='-')
+        root = cls.objects.filter(parent_key='').exclude(key__startswith='-')
         if root:
             return root[0]
         else:
@@ -364,46 +74,21 @@ class SomeNodesMixin:
     def initial_some_nodes(cls):
         cls.default_node()
 
-    @classmethod
-    def modify_other_org_root_node_key(cls):
-        """
-        解决创建 default 节点失败的问题，
-        因为在其他组织下存在 default 节点，故在 DEFAULT 组织下 get 不到 create 失败
-        """
-        logger.info("Modify other org root node key")
 
-        with tmp_to_org(Organization.root()):
-            node_key1 = cls.objects.filter(key='1').first()
-            if not node_key1:
-                logger.info("Not found node that `key` = 1")
-                return
-            if not node_key1.org.is_real():
-                logger.info("Org is not real for node that `key` = 1")
-                return
-
-        with transaction.atomic():
-            with tmp_to_org(node_key1.org):
-                org_root_node_new_key = cls.get_next_org_root_node_key()
-                for n in cls.objects.all():
-                    old_key = n.key
-                    key_list = n.key.split(':')
-                    key_list[0] = org_root_node_new_key
-                    new_key = ':'.join(key_list)
-                    n.key = new_key
-                    n.save()
-                    logger.info('Modify key ( {} > {} )'.format(old_key, new_key))
-
-
-class Node(OrgModelMixin, SomeNodesMixin, FamilyMixin, NodeAssetsMixin):
+class Node(OrgModelMixin, SomeNodesMixin, NodeAssetsMixin):
     id = models.UUIDField(default=uuid.uuid4, primary_key=True)
     key = models.CharField(unique=True, max_length=64, verbose_name=_("Key"))  # '1:1:1:1'
     value = models.CharField(max_length=128, verbose_name=_("Value"))
-    full_value = models.CharField(max_length=4096, verbose_name=_('Full value'), default='')
     child_mark = models.IntegerField(default=0)
     date_create = models.DateTimeField(auto_now_add=True)
     parent_key = models.CharField(max_length=64, verbose_name=_("Parent key"),
                                   db_index=True, default='')
     assets_amount = models.IntegerField(default=0)
+    left = models.IntegerField(default=0, null=False, db_index=True)
+    right = models.IntegerField(default=0, null=False, db_index=True)
+    level = models.IntegerField(default=0, null=False, db_index=True)
+    parent = models.ForeignKey('self', db_constraint=False, on_delete=models.PROTECT,
+                               default=None, null=True, related_name='children')
 
     objects = OrgManager.from_queryset(NodeQuerySet)()
     is_node = True
@@ -411,16 +96,11 @@ class Node(OrgModelMixin, SomeNodesMixin, FamilyMixin, NodeAssetsMixin):
 
     class Meta:
         verbose_name = _("Node")
-        ordering = ['value']
+        ordering = ['key']
 
     def __str__(self):
-        return self.full_value
+        return self.value
 
-    # def __eq__(self, other):
-    #     if not other:
-    #         return False
-    #     return self.id == other.id
-    #
     def __gt__(self, other):
         self_key = [int(k) for k in self.key.split(':')]
         other_key = [int(k) for k in other.key.split(':')]
@@ -438,18 +118,11 @@ class Node(OrgModelMixin, SomeNodesMixin, FamilyMixin, NodeAssetsMixin):
     def name(self):
         return self.value
 
-    def computed_full_value(self):
+    @lazyproperty
+    def full_value(self):
         # 不要在列表中调用该属性
-        values = self.__class__.objects.filter(
-            key__in=self.get_ancestor_keys()
-        ).values_list('key', 'value')
-        values = [v for k, v in sorted(values, key=lambda x: len(x[0]))]
-        values.append(str(self.value))
-        return '/' + '/'.join(values)
-
-    @property
-    def level(self):
-        return len(self.key.split(':'))
+        values = self.get_ancestors().values_list('value')
+        return ' / '.join(values)
 
     def as_tree_node(self):
         from common.tree import TreeNode
@@ -485,21 +158,182 @@ class Node(OrgModelMixin, SomeNodesMixin, FamilyMixin, NodeAssetsMixin):
             return
         return super().delete(using=using, keep_parents=keep_parents)
 
-    def update_child_full_value(self):
-        nodes = self.get_all_children(with_self=True)
-        sort_key_func = lambda n: [int(i) for i in n.key.split(':')]
-        nodes_sorted = sorted(list(nodes), key=sort_key_func)
-        nodes_mapper = {n.key: n for n in nodes_sorted}
-        for node in nodes_sorted:
-            parent = nodes_mapper.get(node.parent_key)
-            if not parent:
-                logger.error(f'Node parent node in mapper: {node.parent_key} {node.value}')
-                continue
-            node.full_value = parent.full_value + '/' + node.value
-        self.__class__.objects.bulk_update(nodes, ['full_value'])
+    @property
+    def ancestors(self):
+        return self.get_ancestors(with_self=False)
 
-    def save(self, *args, **kwargs):
-        self.full_value = self.computed_full_value()
-        instance = super().save(*args, **kwargs)
-        self.update_child_full_value()
-        return instance
+    def get_ancestors(self, with_self=False):
+        if with_self:
+            q = Q(left__lte=self.left, right__gte=self.right)
+        else:
+            q = Q(left__lt=self.left, right__gt=self.right)
+
+        org = get_current_org()
+        if not org or org.is_root():
+            q &= Q(org_id=self.org_id)
+
+        return self.__class__.objects.filter(q).order_by('left')
+
+    def get_descendant(self, with_self=False):
+        if with_self:
+            q = Q(left__gte=self.left, right__lte=self.right)
+        else:
+            q = Q(left__gt=self.left, right__lt=self.right)
+
+        org = get_current_org()
+        if not org or org.is_root():
+            q &= Q(org_id=self.org_id)
+
+        return self.__class__.objects.filter(q)
+
+    @property
+    def descendant(self):
+        return self.get_descendant(with_self=False)
+
+    def create_child(self, value=None, _id=None):
+        with atomic(savepoint=False):
+            index = self.right
+            self._update_mptt_serial(index)
+            child = self.__class__.objects.create(
+                id=_id, value=value, parent=self,
+                left=index, right=index + 1, level=self.level+1
+            )
+            return child
+
+    def get_or_create_child(self, value, _id=None):
+        """
+        :return: Node, bool (created)
+        """
+        children = self.children
+        exist = children.filter(value=value).exists()
+        if exist:
+            child = children.filter(value=value).first()
+            created = False
+        else:
+            child = self.create_child(value, _id)
+            created = True
+        return child, created
+
+    @property
+    def parent(self):
+        if self.is_org_root():
+            return self
+        return self.parent
+
+    def _update_mptt_serial(self, serial, offset=2):
+        to_update_nodes = Node.objects.filter(
+            right__gte=serial
+        )
+        to_update_nodes.update(
+            right=F('right') + offset,
+            left=Case(
+                When(left__gt=serial, then=F('left') + offset),
+                default=F('left'),
+                output_field=models.IntegerField()
+            )
+        )
+
+    @classmethod
+    def init_mptt_serial(cls, node, serial=1):
+        node: Node
+
+        brothers = Stack()
+        ancestors = Stack()
+        to_update_nodes = []
+
+        while node:
+            # 一个空白的节点
+            node.left = serial
+            serial += 1
+            children = node.children.all()
+            if children:
+                ancestors.push(node)
+                node, *children = children
+                brothers.push_all(children)
+            else:
+                while node:
+                    node.right = serial
+                    serial += 1
+                    to_update_nodes.append(node)
+                    may_brother: Node = brothers.top
+                    if may_brother and may_brother.parent_id == node.parent_id:
+                        node = brothers.pop()
+                        # 终止当前循环，进入外层循环
+                        break
+                    else:
+                        if ancestors:
+                            node = ancestors.pop()
+                            continue
+                        else:
+                            # 没有祖先节点了，整个任务结束
+                            node = None
+                            break
+
+        Node.objects.bulk_update(to_update_nodes, fields=('left', 'right'))
+
+    @parent.setter
+    def parent(self, parent):
+        with transaction.atomic(savepoint=False):
+            parent: Node
+            self: Node
+
+            serial = parent.right
+            offset = self.right - self.left + 1
+            self._update_mptt_serial(serial, offset)
+            self.init_mptt_serial(self, serial=serial)
+
+    def get_next_child_preset_name(self):
+        name = ugettext("New node")
+        values = [
+            child.value[child.value.rfind(' '):]
+            for child in self.children.filter(value__startswith=name)
+        ]
+        values = [int(value) for value in values if value.strip().isdigit()]
+        count = max(values) + 1 if values else 1
+        return '{} {}'.format(name, count)
+
+    def get_siblings(self, with_self=False):
+        sibling = Node.objects.filter(
+            parent_id=self.parent_id
+        )
+        if not with_self:
+            sibling = sibling.exclude(id=self.id)
+        return sibling
+
+    def get_all_assets(self):
+        from .asset import Asset
+        return Asset.objects.filter(
+            nodes__left_gte=self.left,
+            nodes__right__lte=self.right
+        ).distinct()
+
+    def get_assets(self):
+        from .asset import Asset
+        return Asset.objects.filter(
+            nodes=self
+        ).distinct()
+
+    @classmethod
+    def get_nodes_all_assets_ids(cls, nodes_id):
+        assets_ids = cls.get_nodes_all_assets(nodes_keys).values_list('id', flat=True)
+        return assets_ids
+
+    @classmethod
+    def get_nodes_all_assets(cls, nodes_ids, extra_assets_ids=None):
+        from .asset import Asset
+        nodes_keys = cls.clean_children_keys(nodes_keys)
+        q = Q()
+        node_ids = ()
+        for key in nodes_keys:
+            q |= Q(key__startswith=f'{key}:')
+            q |= Q(key=key)
+        if q:
+            node_ids = Node.objects.filter(q).distinct().values_list('id', flat=True)
+
+        q = Q(nodes__id__in=list(node_ids))
+        if extra_assets_ids:
+            q |= Q(id__in=extra_assets_ids)
+        if q:
+            return Asset.org_objects.filter(q).distinct()
+        else:
+            return Asset.objects.none()

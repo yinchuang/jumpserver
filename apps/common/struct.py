@@ -26,6 +26,9 @@ class Stack(list):
     def push(self, item):
         self.append(item)
 
+    def push_all(self, items):
+        self.extend(items)
+
 
 class QuerySetChain:
     def __init__(self, querysets):
