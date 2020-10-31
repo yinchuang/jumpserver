@@ -91,6 +91,20 @@ class LoggingSettingSerializer(serializers.Serializer):
     SYSLOG_SOCKTYPE = serializers.ChoiceField(choices=((2, 'UDP'), (1, 'TCP')))
 
 
+class FTPReplaySerializer(serializers.Serializer):
+    TYPE = serializers.ChoiceField(choices=(('ftp', 'FTP'),))
+    HOST = serializers.CharField(max_length=1024, required=False)
+    PORT = serializers.IntegerField(default=21, required=False)
+    USERNAME = serializers.CharField(max_length=1024, required=False)
+    PASSWORD = serializers.CharField(write_only=True, required=False)
+    PASV = serializers.BooleanField(default=False, required=False)
+    DIR = serializers.CharField(default='jumpserver', required=False)
+
+
+class ServerReplaySettingSerializer(serializers.Serializer):
+    SERVER_REPLAY_STORAGE = FTPReplaySerializer()
+
+
 class SettingsSerializer(serializers.Serializer):
     basic = BasicSettingSerializer(required=False)
     email = EmailSettingSerializer(required=False)
@@ -99,6 +113,7 @@ class SettingsSerializer(serializers.Serializer):
     terminal = TerminalSettingSerializer(required=False)
     security = SecuritySettingSerializer(required=False)
     logging = LoggingSettingSerializer(required=False)
+    replay = ServerReplaySettingSerializer(required=False)
 
     encrypt_fields = ["EMAIL_HOST_PASSWORD", "AUTH_LDAP_BIND_PASSWORD"]
 
