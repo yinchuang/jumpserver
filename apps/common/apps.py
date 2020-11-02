@@ -28,6 +28,9 @@ class CommonConfig(AppConfig):
         from .signals import django_ready
         if 'migrate' not in sys.argv:
             django_ready.send(CommonConfig)
-        if settings.SYSLOG_ENABLE:
-            set_rsyslog()
+        try:
+            if settings.SYSLOG_ENABLE:
+                set_rsyslog()
+        except:
+            pass
 
