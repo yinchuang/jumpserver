@@ -235,6 +235,9 @@ class Node(OrgModelMixin, SomeNodesMixin, NodeAssetsMixin):
 
     @classmethod
     def init_mptt_serial(cls, node, serial=1):
+        """
+        将一棵树初始化为 MPTT 树，初始的左值为 `serial`
+        """
         node: Node
 
         brothers = Stack()
@@ -314,14 +317,15 @@ class Node(OrgModelMixin, SomeNodesMixin, NodeAssetsMixin):
         ).distinct()
 
     @classmethod
-    def get_nodes_all_assets_ids(cls, nodes_id):
+    def get_nodes_all_assets_ids(cls, nodes_keys):
+        # TODO
         assets_ids = cls.get_nodes_all_assets(nodes_keys).values_list('id', flat=True)
         return assets_ids
 
     @classmethod
-    def get_nodes_all_assets(cls, nodes_ids, extra_assets_ids=None):
+    def get_nodes_all_assets(cls, nodes_keys, extra_assets_ids=None):
+        # TODO
         from .asset import Asset
-        nodes_keys = cls.clean_children_keys(nodes_keys)
         q = Q()
         node_ids = ()
         for key in nodes_keys:
