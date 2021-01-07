@@ -4,7 +4,7 @@ from collections import defaultdict
 from functools import partial
 
 from django.db.models.signals import m2m_changed
-from django.db.models.signals import post_save
+from django.db.models.signals import post_save, post_delete, pre_delete
 from django.dispatch import receiver
 
 from orgs.utils import tmp_to_org
@@ -13,6 +13,7 @@ from .hands import set_current_org, Node, get_current_org
 from perms.models import (AssetPermission, ApplicationPermission)
 from users.models import UserGroup, User
 from common.const.signals import PRE_REMOVE, POST_REMOVE
+from .caches import OrgResourceStatisticsCache
 
 
 @receiver(post_save, sender=Organization)
@@ -106,3 +107,67 @@ def on_org_user_changed(action, instance, reverse, pk_set, **kwargs):
 
             leaved_users = set(pk_set) - set(org.members.filter(id__in=user_pk_set).values_list('id', flat=True))
             _clear_users_from_org(org, leaved_users)
+
+
+# 缓存相关
+# -----------------------------------------------------
+
+def refresh_user_amount_on_user_create_or_delete(user_id):
+    org_ids = OrganizationMember.objects.distinct().filter(
+        user_id=user_id
+    ).values_list('org_id', flat=True)
+    for org_id in org_ids:
+        org_cache = OrgResourceStatisticsCache(org_id)
+        org_cache.refresh_async('users_amount')
+
+
+@receiver(post_save, sender=User)
+def on_user_create(sender, instance, created, **kwargs):
+    if created:
+        refresh_user_amount_on_user_create_or_delete(instance.id)
+
+
+@receiver(pre_delete, sender=User)
+def on_user_delete(sender, instance, **kwargs):
+    refresh_user_amount_on_user_create_or_delete(instance.id)
+
+
+@receiver(m2m_changed, sender=OrganizationMember)
+def on_org_user_changed(sender, action, instance, reverse, pk_set, **kwargs):
+    if not action.startswith('POST'):
+        return
+
+    if reverse:
+        org_ids = pk_set
+    else:
+        org_ids = [instance.id]
+
+    for org_id in org_ids:
+        org_cache = OrgResourceStatisticsCache(org_id)
+        org_cache.refresh_async('users_amount')
+
+
+@receiver(post_save, sender=UserGroup)
+def on_user_group_create(sender, instance, created, **kwargs):
+    if created:
+        org_cache = OrgResourceStatisticsCache(instance.org_id)
+        org_cache.refresh_async('groups_amount')
+
+
+@receiver(pre_delete, sender=UserGroup)
+def on_user_group_delete(sender, instance, **kwargs):
+    org_cache = OrgResourceStatisticsCache(instance.org_id)
+    org_cache.refresh_async('groups_amount')
+
+
+@receiver(post_save, sender=AssetPermission)
+def on_asset_perm_create(sender, instance, created, **kwargs):
+    if created:
+        org_cache = OrgResourceStatisticsCache(instance.org_id)
+        org_cache.refresh_async('asset_perms_amount')
+
+
+@receiver(pre_delete, sender=AssetPermission)
+def on_asset_perm_delete(sender, instance, **kwargs):
+    org_cache = OrgResourceStatisticsCache(instance.org_id)
+    org_cache.refresh_async('asset_perms_amount')

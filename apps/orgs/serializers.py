@@ -20,10 +20,14 @@ class OrgSerializer(ModelSerializer):
         list_serializer_class = AdaptedBulkListSerializer
         fields_mini = ['id', 'name']
         fields_small = fields_mini + [
-            'created_by', 'date_created', 'comment'
+            'created_by', 'date_created', 'comment', 'users_amount'
+        ]
+        fields_cache = [
+            'groups_amount', 'nodes_amount',
+            'assets_amount', 'asset_perms_amount'
         ]
         fields_m2m = ['users', 'admins', 'auditors']
-        fields = fields_small + fields_m2m
+        fields = fields_small + fields_m2m + fields_cache
         read_only_fields = ['created_by', 'date_created']
 
     def create(self, validated_data):

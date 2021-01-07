@@ -7,7 +7,7 @@ from django.db.models import signals
 from django.db.models import Q
 from django.utils.translation import ugettext_lazy as _
 
-from common.utils import is_uuid
+from common.utils import is_uuid, lazyproperty
 from common.const import choices
 from common.db.models import ChoiceSet
 
@@ -214,6 +214,36 @@ class Organization(models.Model):
     def change_to(self):
         from .utils import set_current_org
         set_current_org(self)
+
+    @lazyproperty
+    def resource_statistics_cache(self):
+        from .caches import OrgResourceStatisticsCache
+        return OrgResourceStatisticsCache(self.id)
+
+    @property
+    def users_amount(self):
+        return self.resource_statistics_cache.users_amount
+
+    @property
+    def groups_amount(self):
+        return self.resource_statistics_cache.groups_amount
+
+    @property
+    def nodes_amount(self):
+        return self.resource_statistics_cache.nodes_amount
+
+    @property
+    def assets_amount(self):
+        from assets.models import Node
+        from orgs.utils import tmp_to_org
+
+        with tmp_to_org(self):
+            node = Node.org_root()
+            return node.assets_amount
+
+    @property
+    def asset_perms_amount(self):
+        return self.resource_statistics_cache.asset_perms_amount
 
 
 def _convert_to_uuid_set(users):
