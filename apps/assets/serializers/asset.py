@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 #
 from rest_framework import serializers
+from rest_framework.validators import UniqueValidator
 from django.db.models import F
 
 from django.utils.translation import ugettext_lazy as _
@@ -176,6 +177,7 @@ class AssetDisplaySerializer(AssetSerializer):
 
 class PlatformSerializer(serializers.ModelSerializer):
     meta = serializers.DictField(required=False, allow_null=True)
+    name = serializers.SlugField(allow_unicode=True, label=_('name'), max_length=50, validators=[UniqueValidator(queryset=Platform.objects.all())])
 
     class Meta:
         model = Platform

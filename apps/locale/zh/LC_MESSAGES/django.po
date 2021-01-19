@@ -4566,3 +4566,11 @@ msgstr "旗舰版"
 #: xpack/plugins/license/models.py:77
 msgid "Community edition"
 msgstr "社区版"
+
+#: rest_framework/fields.py:838
+msgid "Enter a valid \"slug\" consisting of letters, numbers, underscores or hyphens."
+msgstr "输入由字母，数字，下划线或连字符号组成的有效“字段”。"
+
+#: rest_framework/fields.py:839
+msgid "Enter a valid \"slug\" consisting of Unicode letters, numbers, underscores, or hyphens."
+msgstr "输入由Unicode字母，数字，下划线或连字符号组成的有效“字段”。"
