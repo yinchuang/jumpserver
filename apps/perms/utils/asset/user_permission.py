@@ -3,17 +3,21 @@ from operator import or_, and_
 from uuid import uuid4
 import threading
 import inspect
+from collections import defaultdict, namedtuple
+from itertools import chain
 
 from django.conf import settings
 from django.db.models import F, Q, Value, BooleanField
 from django.utils.translation import ugettext_lazy as _
 
+from common.struct import Stack
+from common.utils import timeit
 from common.http import is_true
 from common.utils import get_logger
 from common.const.distributed_lock_key import UPDATE_MAPPING_NODE_TASK_LOCK_KEY
 from orgs.utils import tmp_to_root_org
 from common.utils.timezone import dt_formater, now
-from assets.models import Node, Asset, FavoriteAsset
+from assets.models import Node, Asset, FavoriteAsset, NodeAssetRelatedRecord
 from django.db.transaction import atomic
 from orgs import lock
 from perms.models import UserGrantedMappingNode, RebuildUserTreeTask, AssetPermission
@@ -127,6 +131,7 @@ def rebuild_user_mapping_nodes_with_lock(user: User):
     rebuild_user_mapping_nodes(user)
 
 
+@timeit
 def compute_tmp_mapping_node_from_perm(user: User, asset_perms_id=None):
     node_only_fields = ('id', 'key', 'parent_key', 'assets_amount')
 
@@ -137,6 +142,8 @@ def compute_tmp_mapping_node_from_perm(user: User, asset_perms_id=None):
     nodes = Node.objects.filter(
         granted_by_permissions__id__in=asset_perms_id
     ).distinct().only(*node_only_fields)
+
+    # 授权的节点 key 集合
     granted_key_set = {_node.key for _node in nodes}
 
     def _has_ancestor_granted(node):
@@ -160,7 +167,7 @@ def compute_tmp_mapping_node_from_perm(user: User, asset_perms_id=None):
     # 查询授权资产关联的节点设置
     def process_direct_granted_assets():
         # 查询直接授权资产
-        asset_ids = Asset.objects.filter(
+        asset_ids = Asset.org_objects.filter(
             granted_by_permissions__id__in=asset_perms_id
         ).distinct().values_list('id', flat=True)
         # 查询授权资产关联的节点设置
@@ -226,6 +233,88 @@ def set_node_granted_assets_amount(user, node, asset_perms_id=None):
         else:
             assets_amount = count_node_all_granted_assets(user, node.key, asset_perms_id)
     setattr(node, TMP_GRANTED_ASSETS_AMOUNT_FIELD, assets_amount)
+
+
+def compute_node_assets_amount(tmp_nodes, asset_perms_id):
+    """
+    granted_node_ids
+    asset_granted_node_ids
+
+    asset_granted_ids -> AssetPermission.assets.through asset_perms_id
+
+    都能查出节点与资产的 pairs
+
+    node_id --> asset_ids
+    """
+    TreeNode = namedtuple('TreeNode', field_names=('id', 'children', 'assets_amount', 'parent_key'))
+
+    tree = {}
+
+    granted_node_ids = []
+    asset_granted_node_ids = []
+
+    not_found_parent_node = []
+    header = []
+
+    for node in tmp_nodes:
+        if is_direct_granted_by_annotate(node):
+            granted_node_ids.append(node.id)
+        elif is_asset_granted(node):
+            asset_granted_node_ids.append(node.id)
+
+        tree_node = TreeNode(node.id, [], 0, node.parent_key)
+        tree[node.key] = tree_node
+        if node.parent_key in tree:
+            tree[node.parent_key].children.append(tree_node)
+        else:
+            not_found_parent_node.append(tree_node)
+
+    for node in not_found_parent_node:
+        if node.parent_key in tree:
+            tree[node.parent_key].children.append(node)
+        else:
+            header.append(node)
+
+    if len(header) != 1:
+        raise ValueError
+
+    node_asset_pairs_1 = NodeAssetRelatedRecord.objects.filter(node_id__in=granted_node_ids).values_list('node_id', 'asset_id')
+    direct_granted_asset_ids = set(AssetPermission.assets.through.objects.filter(assetpermission_id__in=asset_perms_id).values_list('asset_id', flat=True))
+    node_asset_pairs_2 = Asset.nodes.through.objects.filter(asset_id__in=direct_granted_asset_ids).values_list('node_id', 'asset_id')
+
+    node_assets = defaultdict(set)
+    for node_id, asset_id in chain(node_asset_pairs_1, node_asset_pairs_2):
+        node_assets[node_id].add(asset_id)
+
+    wait_stack = Stack()
+    unprocess_stack = Stack()
+
+    unprocess_stack.push(header)
+
+    while unprocess_stack:
+        node = unprocess_stack.pop()
+        children = node.children
+        if children:
+            wait_stack.push(node)
+            for n in children:
+                unprocess_stack.push(n)
+                continue
+        else:
+            while node:
+                node.assets_amount = len(node_assets[node.id])
+                if unprocess_stack.top.parent_key == node.parent_key:
+                    node = None
+                else:
+                    if not wait_stack:
+                        node = None
+                    node = wait_stack.pop()
+                    node: TreeNode
+                    parent_asset_ids_set = set()
+                    for child in node.children:
+                        child_asset_ids_set = node_assets.pop(child.id)
+                        parent_asset_ids_set.update(child_asset_ids_set)
+                        del child_asset_ids_set
+                    node_assets[node.id] = parent_asset_ids_set
 
 
 @tmp_to_root_org()
